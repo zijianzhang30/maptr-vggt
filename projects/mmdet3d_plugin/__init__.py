@@ -8,6 +8,7 @@ from .datasets.pipelines import (
 from .models.backbones.vovnet import VoVNet
 from .models.utils import *
 from .models.opt.adamw import AdamW2
+from .models.hooks import DistillWeightScheduleHook
 from .bevformer import *
 from .maptr import *
 from .models.backbones.efficientnet import EfficientNet

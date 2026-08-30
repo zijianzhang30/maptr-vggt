@@ -27,6 +27,19 @@ class CustomNuScenesDataset(NuScenesDataset):
         self.queue_length = queue_length
         self.overlap_test = overlap_test
         self.bev_size = bev_size
+
+    def __getstate__(self):
+        """Make dataset spawn-safe for DataLoader workers."""
+        state = self.__dict__.copy()
+        # nuscenes DetectionConfig keeps dict_keys objects internally.
+        state['eval_detection_configs'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if getattr(self, 'eval_detection_configs', None) is None and hasattr(self, 'eval_version'):
+            from nuscenes.eval.detection.config import config_factory
+            self.eval_detection_configs = config_factory(self.eval_version)
         
     def prepare_train_data(self, index):
         """

@@ -2,7 +2,12 @@
 import numba
 import numpy as np
 import warnings
-from numba.errors import NumbaPerformanceWarning
+
+try:
+    from numba.errors import NumbaPerformanceWarning
+except ImportError:
+    # Newer numba releases moved the warning types under numba.core.errors.
+    from numba.core.errors import NumbaPerformanceWarning
 
 from mmdet3d.core.bbox import box_np_ops
 

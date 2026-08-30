@@ -175,6 +175,13 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
     return np.array(can_bus)
 
 
+class _DummyNuScenesCanBus:
+    """Fallback provider that forces zero CAN bus features."""
+
+    def get_messages(self, scene_name, channel):
+        raise KeyError(f'CAN bus data unavailable for {scene_name}:{channel}')
+
+
 def obtain_sensor2top(nusc,
                       sensor_token,
                       l2e_t,
@@ -775,7 +782,12 @@ def create_nuscenes_infos(root_path,
     from nuscenes.can_bus.can_bus_api import NuScenesCanBus
     print(version, root_path)
     nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
-    nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
+    try:
+        nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
+    except Exception as exc:
+        print(f'Warning: failed to load CAN bus data from {can_bus_root_path}: {exc}')
+        print('Warning: continuing with zero-filled CAN bus features; this is not the official setup.')
+        nusc_can_bus = _DummyNuScenesCanBus()
     MAPS = ['boston-seaport', 'singapore-hollandvillage',
                      'singapore-onenorth', 'singapore-queenstown']
     nusc_maps = {}

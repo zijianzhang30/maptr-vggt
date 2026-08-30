@@ -267,7 +267,10 @@ class MapTRHead(DETRHead):
                 prev_bev=prev_bev
         )
 
-        bev_embed, hs, init_reference, inter_references = outputs
+        if len(outputs) == 5:
+            bev_embed, _, hs, init_reference, inter_references = outputs
+        else:
+            bev_embed, hs, init_reference, inter_references = outputs
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
         outputs_coords = []
@@ -764,4 +767,3 @@ class MapTRHead(DETRHead):
             ret_list.append([bboxes, scores, labels, pts])
 
         return ret_list
-

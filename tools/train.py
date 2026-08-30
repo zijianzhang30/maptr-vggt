@@ -16,6 +16,7 @@ import warnings
 from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 from os import path as osp
+import mmcv.utils.config as mmcv_config_module
 
 from mmdet import __version__ as mmdet_version
 from mmdet3d import __version__ as mmdet3d_version
@@ -28,6 +29,30 @@ from mmdet.apis import set_random_seed
 from mmseg import __version__ as mmseg_version
 
 from mmcv.utils import TORCH_VERSION, digit_version
+
+
+def _patch_mmcv_format_code():
+    """Compat for older yapf builds without the `verify` kwarg."""
+    original_format_code = mmcv_config_module.FormatCode
+
+    def _format_code_compat(*args, **kwargs):
+        try:
+            return original_format_code(*args, **kwargs)
+        except TypeError as exc:
+            if 'verify' not in str(exc):
+                raise
+            kwargs.pop('verify', None)
+            return original_format_code(*args, **kwargs)
+
+    mmcv_config_module.FormatCode = _format_code_compat
+
+
+def _safe_cfg_text(cfg):
+    """Best-effort config serialization for configs with non-literal objects."""
+    try:
+        return cfg.pretty_text
+    except Exception:
+        return getattr(cfg, 'text', str(cfg._cfg_dict))
 
 
 def parse_args():
@@ -100,6 +125,7 @@ def parse_args():
 
 
 def main():
+    _patch_mmcv_format_code()
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
@@ -172,8 +198,13 @@ def main():
 
     # create work_dir
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
-    # dump config
-    cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
+    # dump config; fall back when pretty-print cannot serialize custom objects
+    cfg_dump_path = osp.join(cfg.work_dir, osp.basename(args.config))
+    try:
+        cfg.dump(cfg_dump_path)
+    except Exception:
+        with open(cfg_dump_path, 'w') as f:
+            f.write(_safe_cfg_text(cfg))
     # init the logger before other steps
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
@@ -197,11 +228,11 @@ def main():
     logger.info('Environment info:\n' + dash_line + env_info + '\n' +
                 dash_line)
     meta['env_info'] = env_info
-    meta['config'] = cfg.pretty_text
+    meta['config'] = _safe_cfg_text(cfg)
 
     # log some basic info
     logger.info(f'Distributed training: {distributed}')
-    logger.info(f'Config:\n{cfg.pretty_text}')
+    logger.info(f'Config:\n{_safe_cfg_text(cfg)}')
 
     # set random seeds
     if args.seed is not None:
@@ -239,7 +270,7 @@ def main():
             mmdet_version=mmdet_version,
             mmseg_version=mmseg_version,
             mmdet3d_version=mmdet3d_version,
-            config=cfg.pretty_text,
+            config=_safe_cfg_text(cfg),
             CLASSES=datasets[0].CLASSES,
             PALETTE=datasets[0].PALETTE  # for segmentors
             if hasattr(datasets[0], 'PALETTE') else None)

@@ -121,6 +121,17 @@ class MapTRPerceptionTransformer(BaseModule):
         normal_(self.cams_embeds)
         xavier_init(self.reference_points, distribution='uniform', bias=0.)
         xavier_init(self.can_bus_mlp, distribution='uniform', bias=0.)
+
+    def _parse_encoder_output(self, encoder_output):
+        """Support both legacy tensor outputs and newer dict outputs."""
+        if isinstance(encoder_output, dict):
+            return encoder_output['bev'], encoder_output.get('depth')
+        if isinstance(encoder_output, (list, tuple)):
+            bev = encoder_output[0]
+            depth = encoder_output[1] if len(encoder_output) > 1 else None
+            return bev, depth
+        return encoder_output, None
+
     # TODO apply fp16 to this module cause grad_norm NAN
     # @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'prev_bev', 'bev_pos'), out_fp32=True)
     def attn_bev_encode(
@@ -201,7 +212,7 @@ class MapTRPerceptionTransformer(BaseModule):
         feat_flatten = feat_flatten.permute(
             0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
 
-        ret_dict = self.encoder(
+        encoder_output = self.encoder(
             bev_queries,
             feat_flatten,
             feat_flatten,
@@ -215,6 +226,11 @@ class MapTRPerceptionTransformer(BaseModule):
             shift=shift,
             **kwargs
         )
+        bev_embed, depth = self._parse_encoder_output(encoder_output)
+        ret_dict = dict(
+            bev=bev_embed,
+            depth=depth
+        )
         return ret_dict
 
     def lss_bev_encode(
@@ -227,9 +243,8 @@ class MapTRPerceptionTransformer(BaseModule):
         # import ipdb;ipdb.set_trace()
         images = mlvl_feats[self.feat_down_sample_indice]
         img_metas = kwargs['img_metas']
-        encoder_outputdict = self.encoder(images,img_metas)
-        bev_embed = encoder_outputdict['bev']
-        depth = encoder_outputdict['depth']
+        encoder_output = self.encoder(images, img_metas)
+        bev_embed, depth = self._parse_encoder_output(encoder_output)
         bs, c, _,_ = bev_embed.shape
         bev_embed = bev_embed.view(bs,c,-1).permute(0,2,1).contiguous()
         ret_dict = dict(

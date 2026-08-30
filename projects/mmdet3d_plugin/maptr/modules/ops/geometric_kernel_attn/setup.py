@@ -26,7 +26,9 @@ def get_extensions():
     extra_compile_args = {"cxx": []}
     define_macros = []
 
-    if torch.cuda.is_available() and CUDA_HOME is not None:
+    # Allow forced CUDA builds when the current shell cannot query devices
+    # directly but the toolkit is installed and the target machine has GPUs.
+    if (torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1") and CUDA_HOME is not None:
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]

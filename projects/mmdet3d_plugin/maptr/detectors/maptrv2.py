@@ -1,10 +1,16 @@
 import copy
+import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
+from projects.mmdet3d_plugin.maptr.distill import (
+    TemporalVGGTBEVDistiller,
+    VGGTFeatureDistiller,
+)
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet3d.ops import Voxelization, DynamicScatter
@@ -36,6 +42,10 @@ class MapTRv2(MVXTwoStageDetector):
                  video_test_mode=False,
                  modality='vision',
                  lidar_encoder=None,
+                 temporal_distill_cfg=None,
+                 pre_lss_distill_cfg=None,
+                 use_student_history_bev=True,
+                 freeze_lss_unused_transformer_params=False,
                  ):
 
         super(MapTRv2,
@@ -57,19 +67,77 @@ class MapTRv2(MVXTwoStageDetector):
             'prev_pos': 0,
             'prev_angle': 0,
         }
+        self.use_student_history_bev = use_student_history_bev
+        if freeze_lss_unused_transformer_params:
+            self._freeze_lss_unused_transformer_params()
+        self._debug_stage_timing = os.environ.get('MAPTR_DEBUG_STAGE_TIMING') == '1'
+        self._debug_forward_count = 0
+        self.temporal_distiller = None
+        self.pre_lss_distiller = None
+        if temporal_distill_cfg is not None and temporal_distill_cfg.get('enable', True):
+            self.temporal_distiller = TemporalVGGTBEVDistiller(
+                cache_root=temporal_distill_cfg['cache_root'],
+                pc_range=temporal_distill_cfg.get('pc_range', self.pts_bbox_head.pc_range),
+                bev_h=temporal_distill_cfg.get('bev_h', self.pts_bbox_head.bev_h),
+                bev_w=temporal_distill_cfg.get('bev_w', self.pts_bbox_head.bev_w),
+                student_channels=temporal_distill_cfg.get('student_channels', self.pts_bbox_head.embed_dims),
+                teacher_channels=temporal_distill_cfg.get('teacher_channels', None),
+                distill_channels=temporal_distill_cfg.get('distill_channels', 128),
+                projector_hidden_channels=temporal_distill_cfg.get('projector_hidden_channels', 256),
+                teacher_num_frames=temporal_distill_cfg.get('teacher_num_frames', 3),
+                ann_file=temporal_distill_cfg.get('ann_file', None),
+                use_map_mask=temporal_distill_cfg.get('use_map_mask', True),
+                use_confidence=temporal_distill_cfg.get('use_confidence', True),
+                ground_height_range=temporal_distill_cfg.get('ground_height_range', None),
+                cache_suffix=temporal_distill_cfg.get('cache_suffix', '.pt'),
+                max_cache_items=temporal_distill_cfg.get('max_cache_items', 32),
+                loss_weight=temporal_distill_cfg.get('loss_weight', 0.05),
+                cosine_weight=temporal_distill_cfg.get('cosine_weight', 1.0),
+                l1_weight=temporal_distill_cfg.get('l1_weight', 0.25),
+                allow_missing_cache=temporal_distill_cfg.get('allow_missing_cache', True),
+            )
+        if pre_lss_distill_cfg is not None and pre_lss_distill_cfg.get('enable', True):
+            self.pre_lss_distiller = VGGTFeatureDistiller(
+                cache_root=pre_lss_distill_cfg['cache_root'],
+                student_channels=pre_lss_distill_cfg.get('student_channels', self.pts_bbox_head.in_channels),
+                teacher_channels=pre_lss_distill_cfg.get('teacher_channels', None),
+                distill_channels=pre_lss_distill_cfg.get('distill_channels', 128),
+                projector_hidden_channels=pre_lss_distill_cfg.get('projector_hidden_channels', 256),
+                feature_level=pre_lss_distill_cfg.get('feature_level', 0),
+                cache_suffix=pre_lss_distill_cfg.get('cache_suffix', '.pt'),
+                max_cache_items=pre_lss_distill_cfg.get('max_cache_items', 128),
+                loss_weight=pre_lss_distill_cfg.get('loss_weight', 0.05),
+                cosine_weight=pre_lss_distill_cfg.get('cosine_weight', 1.0),
+                l1_weight=pre_lss_distill_cfg.get('l1_weight', 0.25),
+                use_confidence=pre_lss_distill_cfg.get('use_confidence', True),
+                allow_missing_cache=pre_lss_distill_cfg.get('allow_missing_cache', True),
+            )
         self.modality = modality
         if self.modality == 'fusion' and lidar_encoder is not None :
             if lidar_encoder["voxelize"].get("max_num_points", -1) > 0:
                 voxelize_module = Voxelization(**lidar_encoder["voxelize"])
             else:
                 voxelize_module = DynamicScatter(**lidar_encoder["voxelize"])
-            self.lidar_modal_extractor = nn.ModuleDict(
+                self.lidar_modal_extractor = nn.ModuleDict(
                 {
                     "voxelize": voxelize_module,
                     "backbone": builder.build_middle_encoder(lidar_encoder["backbone"]),
                 }
-            )
+                    )
             self.voxelize_reduce = lidar_encoder.get("voxelize_reduce", True)
+
+    def _freeze_lss_unused_transformer_params(self):
+        """Freeze BEVFormer-only parameters when the active encoder is LSS."""
+        head = self.pts_bbox_head
+        transformer = head.transformer
+        if getattr(transformer, 'use_attn_bev', False):
+            raise ValueError(
+                'freeze_lss_unused_transformer_params is only valid for the LSS encoder.')
+        head.positional_encoding.row_embed.requires_grad_(False)
+        head.positional_encoding.col_embed.requires_grad_(False)
+        transformer.level_embeds.requires_grad_(False)
+        transformer.cams_embeds.requires_grad_(False)
+        transformer.can_bus_mlp.requires_grad_(False)
 
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
@@ -126,7 +194,8 @@ class MapTRv2(MVXTwoStageDetector):
                           prev_bev=None,
                           gt_depth=None,
                           gt_seg_mask=None,
-                          gt_pv_seg_mask=None,):
+                          gt_pv_seg_mask=None,
+                          return_outs=False,):
         """Forward function'
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -177,6 +246,8 @@ class MapTRv2(MVXTwoStageDetector):
             else:
                 losses[key + "_one2many"] = value * lambda_one2many
         # import ipdb;ipdb.set_trace()
+        if return_outs:
+            return losses, outs
         return losses
 
     def forward_dummy(self, img):
@@ -255,6 +326,13 @@ class MapTRv2(MVXTwoStageDetector):
         
         return lidar_feat
 
+    def _log_debug_stage(self, stage, start_time):
+        if self._debug_stage_timing and self._debug_forward_count == 0:
+            elapsed = time.monotonic() - start_time
+            print(
+                f'[MapTRv2 debug pid={os.getpid()}] {stage}: {elapsed:.3f}s',
+                flush=True)
+
     # @auto_fp16(apply_to=('img', 'points'))
     @force_fp32(apply_to=('img','points','prev_bev'))
     def forward_train(self,
@@ -296,6 +374,8 @@ class MapTRv2(MVXTwoStageDetector):
         Returns:
             dict: Losses of different branches.
         """
+        debug_start = time.monotonic()
+        self._log_debug_stage('entered forward_train', debug_start)
         lidar_feat = None
         if self.modality == 'fusion':
             lidar_feat = self.extract_lidar_feat(points)
@@ -307,17 +387,61 @@ class MapTRv2(MVXTwoStageDetector):
         prev_img_metas = copy.deepcopy(img_metas)
         # prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
         # import pdb;pdb.set_trace()
-        prev_bev = self.obtain_history_bev(prev_img, prev_img_metas) if len_queue>1 else None
+        prev_bev = None
+        if self.use_student_history_bev and len_queue > 1:
+            prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
 
         img_metas = [each[len_queue-1] for each in img_metas]
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        self._log_debug_stage('finished image encoder', debug_start)
         losses = dict()
-        losses_pts = self.forward_pts_train(img_feats, lidar_feat, gt_bboxes_3d,
-                                            gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore, prev_bev, gt_depth,gt_seg_mask,gt_pv_seg_mask)
+        if self.pre_lss_distiller is not None:
+            losses.update(self.pre_lss_distiller(
+                student_img_feats=img_feats,
+                img_metas=img_metas))
+        self._log_debug_stage('finished pre-LSS distillation', debug_start)
+        return_outs = self.temporal_distiller is not None
+        forward_pts_outputs = self.forward_pts_train(
+            img_feats, lidar_feat, gt_bboxes_3d, gt_labels_3d, img_metas,
+            gt_bboxes_ignore, prev_bev, gt_depth, gt_seg_mask, gt_pv_seg_mask,
+            return_outs=return_outs)
+        self._log_debug_stage('finished MapTR head', debug_start)
+        if return_outs:
+            losses_pts, pts_outs = forward_pts_outputs
+        else:
+            losses_pts, pts_outs = forward_pts_outputs, None
 
         losses.update(losses_pts)
+        if self.temporal_distiller is not None and pts_outs is not None:
+            student_bev = self._bev_embed_to_map(
+                pts_outs['bev_embed'], self.pts_bbox_head.bev_h, self.pts_bbox_head.bev_w)
+            distill_losses = self.temporal_distiller(
+                student_bev=student_bev,
+                queue_img_metas=prev_img_metas,
+                gt_seg_mask=gt_seg_mask)
+            losses.update(distill_losses)
+        self._log_debug_stage('finished temporal distillation', debug_start)
+        if self._debug_stage_timing and self._debug_forward_count == 0:
+            print(
+                f'[MapTRv2 debug pid={os.getpid()}] loss keys: {sorted(losses.keys())}',
+                flush=True)
+        self._debug_forward_count += 1
         return losses
+
+    @staticmethod
+    def _bev_embed_to_map(bev_embed, bev_h, bev_w):
+        if bev_embed.dim() != 3:
+            raise ValueError(f'Unexpected bev_embed shape: {tuple(bev_embed.shape)}')
+        num_bev_tokens = bev_h * bev_w
+        if bev_embed.shape[0] == num_bev_tokens:
+            return bev_embed.permute(1, 2, 0).contiguous().view(
+                bev_embed.shape[1], bev_embed.shape[2], bev_h, bev_w)
+        if bev_embed.shape[1] == num_bev_tokens:
+            return bev_embed.permute(0, 2, 1).contiguous().view(
+                bev_embed.shape[0], bev_embed.shape[2], bev_h, bev_w)
+        raise ValueError(
+            f'Unable to reshape bev_embed with shape {tuple(bev_embed.shape)} into '
+            f'[{bev_h} x {bev_w}] BEV tokens.')
 
     def forward_test(self, img_metas, img=None,points=None,  **kwargs):
         for var, name in [(img_metas, 'img_metas')]:
@@ -408,4 +532,3 @@ class MapTRv2(MVXTwoStageDetector):
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         return new_prev_bev, bbox_list
-
