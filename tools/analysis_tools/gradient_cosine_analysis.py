@@ -70,7 +70,12 @@ def main():
     loader = build_dataloader(dataset, samples_per_gpu=args.samples_per_gpu,
                               workers_per_gpu=0, dist=False, shuffle=False)
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg')).cuda()
-    model.eval()  # fixed comparison without BN/dropout state drift
+    # Training graph is required: MapTRv2Head computes one-to-many queries
+    # only when self.training is True.  Reset RNG before each checkpoint/batch
+    # below so dropout randomness remains comparable across checkpoints.
+    model.train()
+    print('model.training:', model.training, flush=True)
+    print('pts_bbox_head.training:', model.pts_bbox_head.training, flush=True)
     groups = module_groups(model)
     unknown = set(args.groups) - set(groups)
     if unknown: raise KeyError('Unavailable parameter groups: ' + ', '.join(sorted(unknown)))
@@ -84,9 +89,8 @@ def main():
             data = scatter(data, [torch.cuda.current_device()])[0]
             try:
                 losses = model(return_loss=True, **data)
+                print('[loss keys]', sorted(losses.keys()), flush=True)
             except RuntimeError as error:
-                if 'input.numel() == 0' in str(error):
-                    print('[skip empty batch]', batch_index, flush=True); continue
                 raise
             map_loss = sum_selected_losses(losses, lambda name: 'loss' in name and not name.startswith('loss_vggt'))
             if map_loss is None: raise RuntimeError('No MapTR losses found')
