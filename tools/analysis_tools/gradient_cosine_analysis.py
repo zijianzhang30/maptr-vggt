@@ -53,6 +53,7 @@ def parse_args():
     parser.add_argument('--checkpoints', nargs='+', default=None)
     parser.add_argument('--batches', type=int, default=100)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--samples-per-gpu', type=int, default=2)
     parser.add_argument('--out-dir', default='work_dirs/grad_conflict_probe')
     parser.add_argument('--groups', nargs='+', default=['img_backbone_layer4', 'img_neck', 'bev_encoder'])
     parser.add_argument('--objectives', nargs='+', default=['loss_vggt_img_feat', 'loss_vggt_feat'])
@@ -66,7 +67,8 @@ def main():
     cfg = Config.fromfile(args.config)
     cfg.model.pretrained = None; cfg.data.workers_per_gpu = 0
     dataset = build_dataset(cfg.data.train)
-    loader = build_dataloader(dataset, samples_per_gpu=1, workers_per_gpu=0, dist=False, shuffle=False)
+    loader = build_dataloader(dataset, samples_per_gpu=args.samples_per_gpu,
+                              workers_per_gpu=0, dist=False, shuffle=False)
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg')).cuda()
     model.eval()  # fixed comparison without BN/dropout state drift
     groups = module_groups(model)
@@ -83,7 +85,7 @@ def main():
             try:
                 losses = model(return_loss=True, **data)
             except RuntimeError as error:
-                if 'input.numel() == 0' in str(error) or 'empty' in str(error).lower():
+                if 'input.numel() == 0' in str(error):
                     print('[skip empty batch]', batch_index, flush=True); continue
                 raise
             map_loss = sum_selected_losses(losses, lambda name: 'loss' in name and not name.startswith('loss_vggt'))
