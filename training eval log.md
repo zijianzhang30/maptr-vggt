@@ -1360,3 +1360,165 @@ Watcher details:
   - 根因 2：当某个 batch/rank 没有有效 temporal teacher（缺 cache 或地图 mask 无有效像素）时，`temporal_distiller.student_proj` 原先不会进入计算图；已改为返回与 `student_proj` 相连的零值 loss。pre-LSS distiller 也加入同样保护。
   - 同时冻结两个 teacher projector，并放进 `torch.no_grad()`，因为 teacher 输出本来就会 `detach`，不应被 DDP 当成待训练分支。
   - 验证：训练已越过此前必现的第二轮错误，并打印 `Epoch [1][10/7033]`、`[20/7033]`、`[30/7033]`。当前约 `5.8~6.1s/iter`，batch size 为每卡 `2`，日志 ETA 约 `11~12` 天。
+
+## 7. Active experiment: VGGT single-frame cosine-only | 2026-08-31
+
+This is the controlled comparison against the single-frame cleanaug
+Cos+L1 run. The only model-loss change is:
+
+```text
+previous: L_vggt = 0.05 * (L_cos + 0.25 * L1)
+current:  L_vggt = 0.05 * L_cos
+```
+
+Configuration:
+
+- config: `projects/configs/maptrv2/maptrv2_nusc_r50_24ep_vggt_prelss_maptrsync_official4_cleanaug_cosonly_g03.py`
+- base config: `maptrv2_nusc_r50_24ep_vggt_prelss_maptrsync_official4_cleanaug.py`
+- teacher: single-frame VGGT cache only
+- pre-LSS distillation: `loss_weight=0.05`, `cosine_weight=1.0`, `l1_weight=0.0`
+- temporal BEV distillation: disabled (`temporal_distill_cfg=None`)
+- student history BEV: disabled (`use_student_history_bev=False`)
+- GPUs: `0,2`, two distributed ranks, per-GPU batch 4
+- environment: conda env `maptr` (Python 3.8.20, PyTorch 1.9.1+cu111)
+- output root: `/data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_g03`
+
+The output root is exposed through this symlink for convenient browsing:
+
+```text
+work_dirs/maptrv2_vggt_prelss_maptrsync_official4_cleanaug_cosonly_g03
+ -> /data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_g03
+```
+
+### Start or resume the training
+
+The standard launch script is:
+
+```bash
+cd /home/zhangzj26/MapTR
+bash work_dirs/launch_vggt_cosonly_cleanaug_g03.sh
+```
+
+The script uses `CUDA_VISIBLE_DEVICES=0,3` for its historical g03 name. The
+currently active launch uses GPUs `0,2`, port `29645`, and tmux session
+`vggt_cosonly_g02`:
+
+```bash
+tmux new-session -d -s vggt_cosonly_g02 \
+  'cd /home/zhangzj26/MapTR && \
+   source /home/zhangzj26/miniconda3/etc/profile.d/conda.sh && \
+   conda activate maptr && \
+   export CUDA_HOME=/usr/local/cuda-11.7 && \
+   export CUDA_VISIBLE_DEVICES=0,2 && \
+   export OMP_NUM_THREADS=1 && export MKL_NUM_THREADS=1 && \
+   export PORT=29645 && \
+   bash tools/dist_train.sh \
+   projects/configs/maptrv2/maptrv2_nusc_r50_24ep_vggt_prelss_maptrsync_official4_cleanaug_cosonly_g03.py \
+   2 --work-dir /data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_g03 \
+   2>&1 | tee -a /data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_g03/tmux_train_g02.log'
+```
+
+Useful monitoring commands:
+
+```bash
+tmux attach -t vggt_cosonly_g02
+tail -f /home/zhangzj26/MapTR/work_dirs/maptrv2_vggt_prelss_maptrsync_official4_cleanaug_cosonly_g03/tmux_train_g02.log
+rg 'Epoch \(val\)|Best NuscMap|Epoch \[' \
+  /data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_g03/tmux_train_g02.log
+nvidia-smi
+```
+
+Checkpoints are written every two epochs in the output root. The best-model
+file is named `best_NuscMap_chamfer/mAP_epoch_<N>.pth`; `latest.pth` points to
+the latest regular epoch checkpoint.
+
+### Current validation record
+
+Validation uses Chamfer AP and runs every two epochs:
+
+| Epoch | divider AP | ped_crossing AP | boundary AP | mAP |
+|---:|---:|---:|---:|---:|
+| 2 | 0.2687 | 0.2243 | 0.3712 | 0.2881 |
+| 4 | 0.3511 | 0.3566 | 0.4463 | **0.3847** |
+
+Best observed result so far: `mAP=0.3847` at epoch 4. At the last log update
+the run was training epoch 6; `loss_vggt_img_feat` was about `0.0145`, and no
+`loss_vggt_feat`, NaN, or CUDA error was observed.
+
+### Runtime compatibility note
+
+On this host, the pinned PyTorch 1.9.1+cu111 build fails to initialize
+cuSOLVER/cuSPARSE for `torch.inverse` on the newer driver/GPU stack. To keep
+the experiment numerically equivalent, `projects/mmdet3d_plugin/maptr/modules/encoder.py`
+uses an analytical batched 3x3 inverse for the camera matrices. This is an
+environment compatibility workaround and is not an experiment variable.
+
+### Resume-from-Epoch-16 diagnostic note | 2026-09-02
+
+To test whether late VGGT distillation hurts the task objective, a diagnostic
+branch was prepared on GPUs `6,7` with this schedule:
+
+```text
+epochs 1-16: loss_weight = 0.05
+epochs 17-24: loss_weight = 0.0
+```
+
+The fresh-start branch was replaced by a more direct experiment: resume the
+constant Cosine-only run from
+`/data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_g03/epoch_16.pth`, then
+disable only the distillation loss from epoch 17 onward. This is a useful
+diagnostic because the first 16 epochs are identical to the constant run,
+although it is not a fully independent from-scratch comparison.
+
+The first `--resume-from` attempt exited before any training iteration. The
+checkpoint itself loads, but MMCV 1.4.0 tries to parse its embedded config and
+fails on the generated first line containing an absolute `_base_` path:
+
+```text
+SyntaxError: invalid syntax ... /tmp/tmp*.py
+/home/zhangzj26/MapTR/projects/configs/datasets/custom_nus-3d.py
+```
+
+This is an old-MMCV checkpoint-config parsing issue, not a model or GPU error.
+The project training API now uses a safe resume path that restores model,
+optimizer, epoch and iteration while skipping only the optional embedded-config
+parse (the world size remains two). The branch was relaunched successfully:
+
+- tmux: `vggt_cosonly_stop16_g67`
+- GPUs: `6,7`
+- work dir: `/data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_stop16_g67`
+- first post-resume record: `Epoch [17][50/3517]`,
+  `pre_lss_distiller.loss_weight=0`, `loss_vggt_img_feat=0.0000`
+
+The launch script passes the checkpoint explicitly because the config default
+is `resume_from=None`:
+
+```bash
+tmux attach -t vggt_cosonly_stop16_g67
+tail -f /data/public/zhangzj26/maptr_vggt_cosonly_cleanaug_stop16_g67/tmux_train_stop16_g67_resume.log
+```
+
+The current run has confirmed `safely resumed epoch 16, iter 56272` and is
+training epoch 17 on GPUs 6,7. The zero-valued `loss_vggt_img_feat` entry is
+kept by the logger for continuity; its effective weight is zero, and
+`loss_vggt_feat` is absent.
+
+### Stop-16 branch results | 2026-09-03
+
+Validation results after resuming the constant Cosine-only run at epoch 16
+and setting the VGGT distillation weight to zero from epoch 17:
+
+| Epoch | divider AP | ped_crossing AP | boundary AP | mAP |
+|---:|---:|---:|---:|---:|
+| 18 | 0.5361 | 0.5294 | 0.5733 | 0.5463 |
+| 20 | 0.5243 | 0.5382 | 0.5764 | 0.5463 |
+| 22 | 0.5272 | 0.5324 | 0.5694 | 0.5430 |
+| 24 | 0.5270 | 0.5304 | 0.5672 | 0.5415 |
+
+The run completed normally at epoch 24. The best observed mAP after branching
+is 0.5463 (epoch 20 is microscopically higher than epoch 18 before rounding),
+compared with 0.5485 at epoch 16 in the constant-distillation run. Relative to
+that run, the stop-16 branch has mAP differences of -0.0018 at epoch 18,
++0.0012 at epoch 20, +0.0050 at epoch 22, and +0.0033 at epoch 24. Thus
+disabling late distillation reduced the late-stage degradation slightly, but
+did not exceed the epoch-16 peak or reverse the overall late decline.

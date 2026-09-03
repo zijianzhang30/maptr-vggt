@@ -25,6 +25,35 @@ import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
+
+
+def _safe_resume_runner(runner, checkpoint):
+    """Resume without requiring MMCV to parse an embedded config string.
+
+    MMCV 1.4.0's ``Runner.resume`` parses ``meta['config']`` only to adjust
+    iteration numbers when the world size changes.  The checkpoint used by the
+    stop16 diagnostic was produced with the same two-rank world size, while
+    its pretty-printed ``_base_`` path is not valid Python for that parser.
+    Restore model, optimizer, epoch and iter directly and skip that optional
+    config-based adjustment.
+    """
+    loaded = runner.load_checkpoint(checkpoint)
+    meta_ckpt = loaded.get('meta', {})
+    runner._epoch = meta_ckpt.get('epoch', 0)
+    runner._iter = meta_ckpt.get('iter', 0)
+    if runner.meta is None:
+        runner.meta = {}
+    runner.meta = meta_ckpt
+    if 'optimizer' in loaded:
+        if isinstance(runner.optimizer, dict):
+            for key, opt_state in loaded['optimizer'].items():
+                runner.optimizer[key].load_state_dict(opt_state)
+        else:
+            runner.optimizer.load_state_dict(loaded['optimizer'])
+    runner.logger.info('safely resumed epoch %d, iter %d (embedded config parse skipped)',
+                       runner.epoch, runner.iter)
+
+
 def custom_train_detector(model,
                    dataset,
                    cfg,
@@ -103,7 +132,7 @@ def custom_train_detector(model,
             'config is now expected to have a `runner` section, '
             'please set `runner` in your config.', UserWarning)
     else:
-        if 'total_epochs' in cfg:
+        if 'total_epochs' in cfg and cfg.runner.get('type') == 'EpochBasedRunner':
             assert cfg.total_epochs == cfg.runner.max_epochs
     if eval_model is not None:
         runner = build_runner(
@@ -193,8 +222,7 @@ def custom_train_detector(model,
             runner.register_hook(hook, priority=priority)
 
     if cfg.resume_from:
-        runner.resume(cfg.resume_from)
+        _safe_resume_runner(runner, cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
-

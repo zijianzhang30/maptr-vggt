@@ -15,6 +15,26 @@ import torch.nn.functional as F
 
 from projects.mmdet3d_plugin.bevformer.modules.encoder import BEVFormerEncoder
 
+
+def _safe_inverse_3x3(matrix):
+    """Invert batched 3x3 matrices without cuSOLVER.
+
+    The pinned PyTorch 1.9.1+cu111 build can fail to create cuSOLVER/cuSPARSE
+    handles on the newer L40S/RTX 4090 driver stack.  MapTR only inverts
+    camera 3x3 matrices here, so an adjugate implementation avoids that
+    runtime dependency while preserving the same numerical operation.
+    """
+    a, b, c = matrix[..., 0, 0], matrix[..., 0, 1], matrix[..., 0, 2]
+    d, e, f = matrix[..., 1, 0], matrix[..., 1, 1], matrix[..., 1, 2]
+    g, h, i = matrix[..., 2, 0], matrix[..., 2, 1], matrix[..., 2, 2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    cof = torch.stack((
+        e * i - f * h, c * h - b * i, b * f - c * e,
+        f * g - d * i, a * i - c * g, c * d - a * f,
+        d * h - e * g, b * g - a * h, a * e - b * d,
+    ), dim=-1).reshape(matrix.shape)
+    return cof / det.unsqueeze(-1).unsqueeze(-1)
+
 def gen_dx_bx(xbound, ybound, zbound):
     dx = torch.Tensor([row[2] for row in [xbound, ybound, zbound]])
     bx = torch.Tensor([row[0] + row[2] / 2.0 for row in [xbound, ybound, zbound]])
@@ -112,7 +132,7 @@ class BaseTransform(BaseModule):
         # B x N x D x H x W x 3
         points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
         points = (
-            torch.inverse(post_rots)
+            _safe_inverse_3x3(post_rots)
             .view(B, N, 1, 1, 1, 3, 3)
             .matmul(points.unsqueeze(-1))
         )
@@ -124,13 +144,13 @@ class BaseTransform(BaseModule):
             ),
             5,
         )
-        combine = rots.matmul(torch.inverse(intrins))
+        combine = rots.matmul(_safe_inverse_3x3(intrins))
         points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
         points += trans.view(B, N, 1, 1, 1, 3)
         # ego_to_lidar
         points -= lidar2ego_trans.view(B, 1, 1, 1, 1, 3)
         points = (
-            torch.inverse(lidar2ego_rots)
+            _safe_inverse_3x3(lidar2ego_rots)
             .view(B, 1, 1, 1, 1, 3, 3)
             .matmul(points.unsqueeze(-1))
             .squeeze(-1)
